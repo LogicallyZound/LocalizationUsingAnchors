@@ -9,6 +9,7 @@ from map_utils import Map
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
 from read_config  import read_config 
+from std_msgs.msg import Bool
 from geometry_msgs.msg import Pose, PoseArray, Twist
 from sklearn.neighbors import NearestNeighbors, KDTree
 import numpy as np
@@ -27,6 +28,7 @@ class Robot():
       self.init_pubs()
       rospy.sleep(3) #make sure we create the Map object in init_subs
       self.init_config() 
+      random.seed(self.seed)
       self.init_particles()
       self.publish_particles()
 
@@ -34,7 +36,15 @@ class Robot():
 
       self.start_moves()
 
+      if self.move_num >= self.total_moves:
+         self.handle_shutdown()
+
       rospy.spin()
+
+   def handle_shutdown(self):
+      self.sim_complete.publish(True) 
+      rospy.sleep(3)
+      rospy.signal_shutdown("Done with Moves")
 
    def init_config(self):
       self.config             = read_config()
@@ -53,6 +63,7 @@ class Robot():
       self.resamp_sig_y       = self.config["resample_sigma_y"]
       self.resamp_sig_a       = self.config["resample_sigma_angle"]
       self.turned             = False
+      self.seed               = self.config["seed"]
 
    def init_map_sub(self):
       self.map_sub  = rospy.Subscriber('/map', OccupancyGrid, self.handle_map_reply)
@@ -64,6 +75,10 @@ class Robot():
                                                 queue_size = 10, latch = True)
       self.likelihood_pub     = rospy.Publisher('/likelihood_field', OccupancyGrid, 
                                                 queue_size = 10, latch = True)
+      self.result_pub         = rospy.Publisher('/result_update', Bool,
+                                                queue_size = 10)
+      self.sim_complete       = rospy.Publisher('/sim_complete', Bool, 
+                                                queue_size = 10)
 
    def handle_map_reply(self, grid):
       if self.map_inited     == 0:
@@ -137,6 +152,7 @@ class Robot():
          self.publish_particles()
          self.turned = False
          move_count += 1
+         self.result_pub.publish(True)
 
    def move_robot(self):
       angle, dist, steps = self.get_move() 
@@ -145,30 +161,27 @@ class Robot():
       p_theta_mov = math.radians(angle)
 
       for p in self.particle_ls:
+         if self.first_move:
+             p_theta_mov = random.gauss(p_theta_mov, self.fm_sigma_ang)      
          p.set_theta( p.theta+p_theta_mov)
          p.update_pose()
 
       #move robot
       for n in range (0, steps):
          helper_functions.move_function(0, dist)
-         print "moved robot"
 
          #move particles?
 
          self.move_particles()
          self.publish_particles()
-         print "moved particles"
 
          self.reweigh_all_particles()
          self.publish_particles()
-         print "reweighed"
 
          self.resample_particles()
          self.publish_particles()
-         print "resampled"
 
          self.publish_particles()
-         print "published"
 
 
    def get_move(self):
@@ -214,11 +227,12 @@ class Robot():
                num_shit_sensors += 1
                Lp = 0
             Pz    = self.laser_z_hit*Lp + self.laser_z_rand
-            p_tot += Pz
+            p_tot += Pz**3
             self.laser_ind += 1
+
          if p.x < 0 or p.y < 0 or p.x >= self.map_width or p.y >= self.map_height:
             p.weight = 0
-         elif self.likelihood_map.get_cell(p.x, p.y) == 1:
+         elif self.likelihood_map.get_cell(p.x, p.y) >=0.9:
             p.weight = 0
          elif num_shit_sensors / self.num_sensors > 0.6:
             p.weight = 0
@@ -244,28 +258,18 @@ class Robot():
          y_bar = dist*math.sin(p.theta)
 
          if self.first_move:
-            print "first move"
             #add noise
             angl, x, y = self.handle_first_particle_move(x_bar, y_bar,p.theta)
-           # p.theta = p.theta+angl
-            p.x = p.x + x_bar
-            p.y = p.y + y_bar
+            p.x = p.x + x
+            p.y = p.y + y
             p.update_pose()
 
          else:
-            #p.move_function(math.degrees(angl), 0)
-            #p.move_function(0, dist)
-            #if self.turned == False:
-           #    print "before: " , p.theta
-           #    p.set_theta( p.theta+angle_rad)
-           #    p.update_pose()
-           #    print "after: " , p.theta
             p.x = p.x + x_bar
             p.y = p.y + y_bar
             p.update_pose()
 
       self.first_move = False
-     # self.turned = True
 
    def handle_first_particle_move(self, x_bar, y_bar, angle):
       mu      = 0
@@ -312,7 +316,6 @@ class Particle():
       self.theta = theta
 
    def move_function (self, angle, dist):
-      #print "stuck here?"
       angle_in_rad = float(angle*math.pi/180.0)
       if angle > 0:
          increment = 10	
